@@ -5,7 +5,6 @@
 #pragma once
 #include <appbase/application.hpp>
 #include <eosio/chain_plugin/chain_plugin.hpp>
-#include <eosio/abi_cache_plugin/abi_cache_plugin.hpp>
 
 namespace eosio {
 
@@ -16,7 +15,7 @@ using namespace appbase;
  */
 class elasticsearch_plugin : public appbase::plugin<elasticsearch_plugin> {
 public:
-   APPBASE_PLUGIN_REQUIRES((chain_plugin)(abi_cache_plugin))
+   APPBASE_PLUGIN_REQUIRES((chain_plugin))
    elasticsearch_plugin();
    virtual ~elasticsearch_plugin();
  

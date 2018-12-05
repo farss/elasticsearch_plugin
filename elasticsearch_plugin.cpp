@@ -28,6 +28,7 @@
 
 #include "elastic_client.hpp"
 #include "exceptions.hpp"
+#include "serializer.hpp"
 #include "bulker.hpp"
 #include "ThreadPool/ThreadPool.h"
 
@@ -68,6 +69,7 @@ public:
    elasticsearch_plugin_impl();
    ~elasticsearch_plugin_impl();
 
+   fc::optional<boost::signals2::scoped_connection> accepted_block_connection;
    fc::optional<boost::signals2::scoped_connection> irreversible_block_connection;
    fc::optional<boost::signals2::scoped_connection> accepted_transaction_connection;
    fc::optional<boost::signals2::scoped_connection> applied_transaction_connection;
@@ -77,6 +79,7 @@ public:
    void process_applied_transaction(chain::transaction_trace_ptr);
    void process_accepted_transaction(chain::transaction_metadata_ptr);
    void process_irreversible_block( chain::block_state_ptr );
+   void process_accepted_block( chain::block_state_ptr );
 
    void upsert_account(
          std::unordered_map<uint64_t, std::pair<std::string, fc::mutable_variant_object>> &account_upsert_actions,
@@ -115,11 +118,10 @@ public:
 
    fc::optional<chain::chain_id_type> chain_id;
 
-   fc::microseconds abi_serializer_max_time;
 
-   abi_cache_plugin* abi_cache_plug;
    std::unique_ptr<elastic_client> es_client;
    std::unique_ptr<bulker_pool> bulk_pool;
+   std::unique_ptr<serializer> serializer;
    std::unique_ptr<ThreadPool> thread_pool;
 
    static const action_name newaccount;
@@ -307,6 +309,8 @@ void elasticsearch_plugin_impl::upsert_account_setabi(
 {
    abi_def abi_def = fc::raw::unpack<chain::abi_def>( setabi.abi );
 
+   serializer->upsert_abi_cache( setabi.account, abi_def );
+
    param_doc("name", setabi.account.to_string());
    param_doc("abi", abi_def);
 }
@@ -392,9 +396,8 @@ void elasticsearch_plugin_impl::process_applied_transaction( chain::transaction_
    if( !start_block_reached || !t->producer_block_id.valid() )
       return;
 
-   transaction_trace_queue.emplace_back(t);
-
    check_task_queue_size();
+   transaction_trace_queue.emplace_back(t);
    thread_pool->enqueue(
       [ this ]()
       {
@@ -472,80 +475,53 @@ void elasticsearch_plugin_impl::process_applied_transaction( chain::transaction_
          }
 
          if( base_action_traces.empty() ) return; //< do not index transaction_trace if all action_traces filtered out
-         check_task_queue_size();
-         thread_pool->enqueue(
-            [ t, base_action_traces{std::move(base_action_traces)}, this ]()
-            {
-               const auto& trx_id = t->id;
-               const auto trx_id_str = trx_id.str();
 
-               if (store_action_traces) {
-                  for (auto& atrace : base_action_traces) {
-                     fc::mutable_variant_object action_traces_doc;
-                     chain::base_action_trace &base = atrace.get();
-                     auto &global_sequence = base.receipt.global_sequence;
-                     auto &name = base.act.account;
-                     auto &abi_sequence = base.receipt.abi_sequence;
+         const auto& trx_id = t->id;
+         const auto trx_id_str = trx_id.str();
 
-                     auto func = [&]( account_name n ) {
-                        EOS_ASSERT( n == name, chain::elasticsearch_exception, "mismatch abi account name" );
-                        return abi_cache_plug->get_abi_serializer( name, abi_sequence );
-                     };
+         if (store_action_traces) {
+            for (auto& atrace : base_action_traces) {
+               fc::mutable_variant_object action_traces_doc;
+               chain::base_action_trace &base = atrace.get();
+               auto &global_sequence = base.receipt.global_sequence;
 
-                     // make sure global height not exceed abi_cahce_plugin processed height
-                     uint64_t elapse = 0, height;
-                     while (!done) {
-                        uint64_t height = abi_cache_plug->global_sequence_height();
-                        if (global_sequence <= height)
-                           break;
-                        if ( elapse > 0 && elapse % 5000 == 0 )
-                           wlog("elapse: ${t} ms, global sequence: ${n}, global sequence height: ${h}", ("t", elapse)("n", global_sequence)("h", height));
-                        elapse += 5;
-                        boost::this_thread::sleep_for( boost::chrono::milliseconds( 5 ));
-                     }
+               fc::from_variant( serializer->to_variant_with_abi( base ), action_traces_doc );
 
-                     fc::variant pretty_output;
-                     abi_serializer::to_variant( base, pretty_output, func, abi_serializer_max_time );
+               fc::mutable_variant_object act_doc;
+               fc::from_variant( action_traces_doc["act"], act_doc );
+               act_doc["data"] = fc::json::to_string( act_doc["data"] );
 
-                     fc::from_variant( pretty_output, action_traces_doc );
+               action_traces_doc["act"] = act_doc;
 
-                     fc::mutable_variant_object act_doc;
-                     fc::from_variant( action_traces_doc["act"], act_doc );
-                     act_doc["data"] = fc::json::to_string( act_doc["data"] );
+               fc::mutable_variant_object action_doc;
+               action_doc("_index", action_traces_index);
+               action_doc("_type", "_doc");
+               action_doc("_id", global_sequence);
 
-                     action_traces_doc["act"] = act_doc;
+               auto action = fc::json::to_string( fc::variant_object("index", action_doc) );
+               auto json = fc::prune_invalid_utf8( fc::json::to_string(action_traces_doc) );
 
-                     fc::mutable_variant_object action_doc;
-                     action_doc("_index", action_traces_index);
-                     action_doc("_type", "_doc");
-                     action_doc("_id", global_sequence);
-
-                     auto action = fc::json::to_string( fc::variant_object("index", action_doc) );
-                     auto json = fc::prune_invalid_utf8( fc::json::to_string(action_traces_doc) );
-
-                     bulker& bulk = bulk_pool->get();
-                     bulk.append_document(std::move(action), std::move(json));
-                  }
-               }
-
-               if (store_transaction_traces) {
-
-                  fc::mutable_variant_object trans_traces_doc(*t);
-
-                  fc::mutable_variant_object action_doc;
-                  action_doc("_index", trans_traces_index);
-                  action_doc("_type", "_doc");
-                  action_doc("_id", trx_id_str);
-
-                  auto action = fc::json::to_string( fc::variant_object("index", action_doc) );
-                  auto json = fc::json::to_string( trans_traces_doc );
-
-                  bulker& bulk = bulk_pool->get();
-                  bulk.append_document(std::move(action), std::move(json));
-               }
-
+               bulker& bulk = bulk_pool->get();
+               bulk.append_document(std::move(action), std::move(json));
             }
-         );
+         }
+
+         if (store_transaction_traces) {
+
+            fc::mutable_variant_object trans_traces_doc;
+            fc::from_variant( serializer->to_variant_with_abi( *t ), trans_traces_doc );
+
+            fc::mutable_variant_object action_doc;
+            action_doc("_index", trans_traces_index);
+            action_doc("_type", "_doc");
+            action_doc("_id", trx_id_str);
+
+            auto action = fc::json::to_string( fc::variant_object("index", action_doc) );
+            auto json = fc::prune_invalid_utf8( fc::json::to_string( trans_traces_doc ) );
+
+            bulker& bulk = bulk_pool->get();
+            bulk.append_document(std::move(action), std::move(json));
+         }
       }
    );
 
@@ -568,9 +544,7 @@ void elasticsearch_plugin_impl::process_accepted_transaction( chain::transaction
          fc::mutable_variant_object trans_doc;
          fc::mutable_variant_object doc;
 
-         fc::variant v;
-         fc::to_variant(trx, v);
-         fc::from_variant( v, trans_doc );
+         fc::from_variant( serializer->to_variant_with_abi( trx ), trans_doc );
          trans_doc("trx_id", trx_id_str);
 
          fc::variant signing_keys;
@@ -598,7 +572,7 @@ void elasticsearch_plugin_impl::process_accepted_transaction( chain::transaction
          action_doc("retry_on_conflict", 100);
 
          auto action = fc::json::to_string( fc::variant_object("update", action_doc) );
-         auto json = fc::json::to_string( doc );
+         auto json = fc::prune_invalid_utf8( fc::json::to_string(doc) );
 
          bulker& bulk = bulk_pool->get();
          bulk.append_document(std::move(action), std::move(json));
@@ -626,22 +600,26 @@ void elasticsearch_plugin_impl::process_irreversible_block(chain::block_state_pt
          if ( block_num % 10000 == 0 )
             ilog("block_num: ${n}", ("n", block_num));
 
-         fc::mutable_variant_object doc(*bs);
 
          if (store_blocks) {
+
+            fc::mutable_variant_object block_doc;
             fc::mutable_variant_object action_doc;
+
+            fc::from_variant( serializer->to_variant_with_abi( bs->block ), block_doc );
             action_doc("_index", blocks_index);
             action_doc("_type", "_doc");
             action_doc("_id", block_id_str);
 
             auto action = fc::json::to_string( fc::variant_object("index", action_doc) );
-            auto json = fc::json::to_string( doc["block"] );
+            auto json = fc::prune_invalid_utf8( fc::json::to_string(block_doc) );
 
             bulker& bulk = bulk_pool->get();
             bulk.append_document(std::move(action), std::move(json));
          }
 
          if (store_block_states) {
+            fc::mutable_variant_object doc(*bs);
             doc.erase("block");
 
             fc::mutable_variant_object action_doc;
@@ -690,7 +668,6 @@ void elasticsearch_plugin_impl::process_irreversible_block(chain::block_state_pt
 
                auto action = fc::json::to_string( fc::variant_object("update", action_doc) );
                auto json = fc::json::to_string( doc );
-
                bulker& bulk = bulk_pool->get();
                bulk.append_document(std::move(action), std::move(json));
             }
@@ -702,6 +679,7 @@ void elasticsearch_plugin_impl::process_irreversible_block(chain::block_state_pt
 void elasticsearch_plugin_impl::check_task_queue_size() {
    auto task_queue_size = thread_pool->queue_size();
    if ( task_queue_size > max_task_queue_size ) {
+
       task_queue_sleep_time += 10;
       if( task_queue_sleep_time > 1000 )
          wlog("thread pool task queue size: ${q}", ("q", task_queue_size));
@@ -739,7 +717,7 @@ void elasticsearch_plugin::set_program_options(options_description&, options_des
    cfg.add_options()
       ("elastic-thread-pool-size", bpo::value<size_t>()->default_value(4),
          "The size of the data processing thread pool.")
-      ("elastic-max-queue-size", bpo::value<size_t>()->default_value(65536),
+      ("elastic-max-queue-size", bpo::value<size_t>()->default_value(512),
        "The max size of the thread pool task queue.")
       ("elastic-bulk-size", bpo::value<size_t>()->default_value(5),
          "The size(megabytes) of the each bulk request.")
@@ -777,7 +755,9 @@ void elasticsearch_plugin::plugin_initialize(const variables_map& options) {
             uint32_t max_time = options.at( "abi-serializer-max-time-ms" ).as<uint32_t>();
             EOS_ASSERT(max_time > chain::config::default_abi_serializer_max_time_ms,
                        chain::plugin_config_exception, "--abi-serializer-max-time-ms required as default value not appropriate for parsing full blocks");
-            my->abi_serializer_max_time = app().get_plugin<chain_plugin>().get_abi_serializer_max_time();
+            fc::microseconds abi_serializer_max_time = app().get_plugin<chain_plugin>().get_abi_serializer_max_time();
+            auto path = app().data_dir() / "abi-cache-data";
+            my->serializer.reset( new serializer(abi_serializer_max_time, path) );
          }
 
          if( options.count( "elastic-block-start" )) {
@@ -862,10 +842,6 @@ void elasticsearch_plugin::plugin_initialize(const variables_map& options) {
          EOS_ASSERT( chain_plug, chain::missing_chain_plugin_exception, "" );
          auto& chain = chain_plug->chain();
          my->chain_id.emplace( chain.get_chain_id());
-
-         abi_cache_plugin* abi_cache_plug = app().find_plugin<abi_cache_plugin>();
-         EOS_ASSERT( abi_cache_plug, chain::missing_chain_plugin_exception, "" );
-         my->abi_cache_plug = abi_cache_plug;
 
          my->accepted_transaction_connection.emplace(
             chain.accepted_transaction.connect( [&]( const chain::transaction_metadata_ptr& t ) {

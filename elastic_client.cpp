@@ -28,11 +28,11 @@ elastic_client::elastic_client(const std::vector<std::string> url_list, const bo
    if ( !boost::filesystem::exists(filename) || boost::filesystem::is_empty(filename) ) {
       ofs.reset( new boost::filesystem::ofstream(filename) );
    } else {
-      wlog("retransfer bulk content: ${p}", ("p", filename));
-      boost::filesystem::ifstream f(filename);
-      std::string content((std::istreambuf_iterator<char>(f)),
+      ilog("retransfer bulk content: ${p}", ("p", filename));
+      boost::filesystem::ifstream ifs(filename);
+      std::string content((std::istreambuf_iterator<char>(ifs)),
                            std::istreambuf_iterator<char>());
-      f.close();
+      ifs.close();
       boost::filesystem::remove(filename);
       ofs.reset( new boost::filesystem::ofstream(filename)) ;
       bulk_perform( content );

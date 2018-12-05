@@ -5,5 +5,5 @@ add_library( elasticsearch_plugin
              bulker.cpp
              ${HEADERS} )
 
-target_link_libraries( elasticsearch_plugin appbase chain_plugin abi_cache_plugin eosio_chain fc elasticlient)
+target_link_libraries( elasticsearch_plugin appbase chain_plugin eosio_chain fc elasticlient)
 target_include_directories( elasticsearch_plugin PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include" )
