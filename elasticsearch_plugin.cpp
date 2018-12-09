@@ -69,17 +69,19 @@ public:
    elasticsearch_plugin_impl();
    ~elasticsearch_plugin_impl();
 
-   fc::optional<boost::signals2::scoped_connection> accepted_block_connection;
    fc::optional<boost::signals2::scoped_connection> irreversible_block_connection;
    fc::optional<boost::signals2::scoped_connection> accepted_transaction_connection;
    fc::optional<boost::signals2::scoped_connection> applied_transaction_connection;
 
    void check_task_queue_size();
 
-   void process_applied_transaction(chain::transaction_trace_ptr);
-   void process_accepted_transaction(chain::transaction_metadata_ptr);
-   void process_irreversible_block( chain::block_state_ptr );
-   void process_accepted_block( chain::block_state_ptr );
+   void process_applied_transaction( const chain::transaction_trace_ptr& );
+   void process_accepted_transaction( const chain::transaction_metadata_ptr& );
+   void process_irreversible_block( const chain::block_state_ptr& );
+
+   void _process_applied_transaction();
+   void _process_accepted_transaction( const chain::transaction_metadata_ptr& );
+   void _process_irreversible_block( const chain::block_state_ptr& );
 
    void upsert_account(
          std::unordered_map<uint64_t, std::pair<std::string, fc::mutable_variant_object>> &account_upsert_actions,
@@ -369,7 +371,7 @@ void elasticsearch_plugin_impl::upsert_account(
             "ctx._source.abi = params[\"%1%\"].abi;";
       }
 
-      if ( !upsert_script.empty() ) {
+      if ( start_block_reached && !upsert_script.empty() ) {
          auto it = account_upsert_actions.find(account_id);
          if ( it != account_upsert_actions.end() ) {
             auto idx = std::to_string(it->second.second.size());
@@ -391,176 +393,243 @@ void elasticsearch_plugin_impl::upsert_account(
 }
 
 
-void elasticsearch_plugin_impl::process_applied_transaction( chain::transaction_trace_ptr t ) {
+void elasticsearch_plugin_impl::_process_applied_transaction() {
 
-   if( !start_block_reached || !t->producer_block_id.valid() )
-      return;
+   chain::transaction_trace_ptr t;
+   std::unordered_map<uint64_t, std::pair<std::string, fc::mutable_variant_object>> account_upsert_actions;
+   std::vector<std::reference_wrapper<chain::base_action_trace>> base_action_traces; // without inline action traces
 
-   check_task_queue_size();
-   transaction_trace_queue.emplace_back(t);
-   thread_pool->enqueue(
-      [ this ]()
-      {
-         chain::transaction_trace_ptr t;
-         std::unordered_map<uint64_t, std::pair<std::string, fc::mutable_variant_object>> account_upsert_actions;
-         std::vector<std::reference_wrapper<chain::base_action_trace>> base_action_traces; // without inline action traces
+   {
+      boost::unique_lock<boost::mutex> lock(trx_que_mtx);
+      t = transaction_trace_queue.front();
+      transaction_trace_queue.pop_front();
 
+      bool executed = t->receipt.valid() && t->receipt->status == chain::transaction_receipt_header::executed;
+
+      std::stack<std::reference_wrapper<chain::action_trace>> stack;
+      for( auto& atrace : t->action_traces ) {
+         stack.emplace(atrace);
+
+         while ( !stack.empty() )
          {
-            boost::unique_lock<boost::mutex> lock(trx_que_mtx);
-            t = transaction_trace_queue.front();
-            transaction_trace_queue.pop_front();
+            auto &atrace = stack.top().get();
+            stack.pop();
 
-            bool executed = t->receipt.valid() && t->receipt->status == chain::transaction_receipt_header::executed;
-
-            std::stack<std::reference_wrapper<chain::action_trace>> stack;
-            for( auto& atrace : t->action_traces ) {
-               stack.emplace(atrace);
-
-               while ( !stack.empty() )
-               {
-                  auto &atrace = stack.top().get();
-                  stack.pop();
-
-                  if( executed && store_accounts && atrace.receipt.receiver == chain::config::system_account_name ) {
-                     upsert_account( account_upsert_actions, atrace.act, atrace.block_time );
-                  }
-
-                  if( start_block_reached && filter_include( atrace.receipt.receiver, atrace.act.name, atrace.act.authorization ) ) {
-                     base_action_traces.emplace_back( atrace );
-                  }
-
-                  auto &inline_traces = atrace.inline_traces;
-                  for( auto it = inline_traces.rbegin(); it != inline_traces.rend(); ++it ) {
-                     stack.emplace(*it);
-                  }
-               }
+            if( executed && store_accounts && atrace.receipt.receiver == chain::config::system_account_name ) {
+               upsert_account( account_upsert_actions, atrace.act, atrace.block_time );
             }
 
-            if ( !account_upsert_actions.empty() ) {
-
-               std::string bulk = "";
-               for( auto& action : account_upsert_actions ) {
-
-                  fc::mutable_variant_object source_doc;
-                  fc::mutable_variant_object script_doc;
-
-                  script_doc("lang", "painless");
-                  script_doc("source", action.second.first);
-                  script_doc("params", action.second.second);
-
-                  source_doc("scripted_upsert", true);
-                  source_doc("upsert", fc::variant_object());
-                  source_doc("script", script_doc);
-
-                  auto id = std::to_string(action.first);
-                  auto json = fc::json::to_string(source_doc);
-
-                  fc::mutable_variant_object action_doc;
-                  action_doc("_index", accounts_index);
-                  action_doc("_type", "_doc");
-                  action_doc("_id", id);
-
-                  auto es_action = fc::json::to_string( fc::variant_object("update", action_doc) );
-
-                  bulk += es_action + '\n';
-                  bulk += json + '\n';
-               }
-
-               try {
-                  es_client->bulk_perform(bulk);
-               } catch( ... ) {
-                  handle_elasticsearch_exception( "upsert accounts", __LINE__ );
-               }
+            if( start_block_reached && filter_include( atrace.receipt.receiver, atrace.act.name, atrace.act.authorization ) ) {
+               base_action_traces.emplace_back( atrace );
             }
-         }
 
-         if( base_action_traces.empty() ) return; //< do not index transaction_trace if all action_traces filtered out
-
-         const auto& trx_id = t->id;
-         const auto trx_id_str = trx_id.str();
-
-         if (store_action_traces) {
-            for (auto& atrace : base_action_traces) {
-               fc::mutable_variant_object action_traces_doc;
-               chain::base_action_trace &base = atrace.get();
-               auto &global_sequence = base.receipt.global_sequence;
-
-               fc::from_variant( serializer->to_variant_with_abi( base ), action_traces_doc );
-
-               fc::mutable_variant_object act_doc;
-               fc::from_variant( action_traces_doc["act"], act_doc );
-               act_doc["data"] = fc::json::to_string( act_doc["data"] );
-
-               action_traces_doc["act"] = act_doc;
-
-               fc::mutable_variant_object action_doc;
-               action_doc("_index", action_traces_index);
-               action_doc("_type", "_doc");
-               action_doc("_id", global_sequence);
-
-               auto action = fc::json::to_string( fc::variant_object("index", action_doc) );
-               auto json = fc::prune_invalid_utf8( fc::json::to_string(action_traces_doc) );
-
-               bulker& bulk = bulk_pool->get();
-               bulk.append_document(std::move(action), std::move(json));
+            auto &inline_traces = atrace.inline_traces;
+            for( auto it = inline_traces.rbegin(); it != inline_traces.rend(); ++it ) {
+               stack.emplace(*it);
             }
-         }
-
-         if (store_transaction_traces) {
-
-            fc::mutable_variant_object trans_traces_doc;
-            fc::from_variant( serializer->to_variant_with_abi( *t ), trans_traces_doc );
-
-            fc::mutable_variant_object action_doc;
-            action_doc("_index", trans_traces_index);
-            action_doc("_type", "_doc");
-            action_doc("_id", trx_id_str);
-
-            auto action = fc::json::to_string( fc::variant_object("index", action_doc) );
-            auto json = fc::prune_invalid_utf8( fc::json::to_string( trans_traces_doc ) );
-
-            bulker& bulk = bulk_pool->get();
-            bulk.append_document(std::move(action), std::move(json));
          }
       }
-   );
+
+      if ( !account_upsert_actions.empty() ) {
+
+         std::string bulk = "";
+         for( auto& action : account_upsert_actions ) {
+
+            fc::mutable_variant_object source_doc;
+            fc::mutable_variant_object script_doc;
+
+            script_doc("lang", "painless");
+            script_doc("source", action.second.first);
+            script_doc("params", action.second.second);
+
+            source_doc("scripted_upsert", true);
+            source_doc("upsert", fc::variant_object());
+            source_doc("script", script_doc);
+
+            auto id = std::to_string(action.first);
+            auto json = fc::json::to_string(source_doc);
+
+            fc::mutable_variant_object action_doc;
+            action_doc("_index", accounts_index);
+            action_doc("_type", "_doc");
+            action_doc("_id", id);
+
+            auto es_action = fc::json::to_string( fc::variant_object("update", action_doc) );
+
+            bulk += es_action + '\n';
+            bulk += json + '\n';
+         }
+
+         try {
+            es_client->bulk_perform(bulk);
+         } catch( ... ) {
+            handle_elasticsearch_exception( "upsert accounts", __LINE__ );
+         }
+      }
+   }
+
+   if( base_action_traces.empty() ) return; //< do not index transaction_trace if all action_traces filtered out
+
+   const auto& trx_id = t->id;
+   const auto trx_id_str = trx_id.str();
+
+   if (store_action_traces) {
+      for (auto& atrace : base_action_traces) {
+         fc::mutable_variant_object action_traces_doc;
+         chain::base_action_trace &base = atrace.get();
+         auto &global_sequence = base.receipt.global_sequence;
+
+         fc::from_variant( serializer->to_variant_with_abi( base ), action_traces_doc );
+
+         fc::mutable_variant_object act_doc;
+         fc::from_variant( action_traces_doc["act"], act_doc );
+         act_doc["data"] = fc::json::to_string( act_doc["data"] );
+
+         action_traces_doc["act"] = act_doc;
+
+         fc::mutable_variant_object action_doc;
+         action_doc("_index", action_traces_index);
+         action_doc("_type", "_doc");
+         action_doc("_id", global_sequence);
+
+         auto action = fc::json::to_string( fc::variant_object("index", action_doc) );
+         auto json = fc::prune_invalid_utf8( fc::json::to_string(action_traces_doc) );
+
+         bulker& bulk = bulk_pool->get();
+         bulk.append_document(std::move(action), std::move(json));
+      }
+   }
+
+   if (store_transaction_traces) {
+
+      fc::mutable_variant_object trans_traces_doc;
+      fc::from_variant( serializer->to_variant_with_abi( *t ), trans_traces_doc );
+
+      fc::mutable_variant_object action_doc;
+      action_doc("_index", trans_traces_index);
+      action_doc("_type", "_doc");
+      action_doc("_id", trx_id_str);
+
+      auto action = fc::json::to_string( fc::variant_object("index", action_doc) );
+      auto json = fc::prune_invalid_utf8( fc::json::to_string( trans_traces_doc ) );
+
+      bulker& bulk = bulk_pool->get();
+      bulk.append_document(std::move(action), std::move(json));
+   }
 
 }
 
-void elasticsearch_plugin_impl::process_accepted_transaction( chain::transaction_metadata_ptr t ) {
-   if( !start_block_reached || !store_transactions )
-      return;
+void elasticsearch_plugin_impl::_process_accepted_transaction( const chain::transaction_metadata_ptr& t ) {
 
-   check_task_queue_size();
-   thread_pool->enqueue(
-      [ t, this ]()
-      {
-         const auto& trx = t->trx;
-         if( !filter_include( trx ) ) return;
+   const auto& trx = t->trx;
+   if( !filter_include( trx ) ) return;
 
-         const auto& trx_id = t->id;
-         const auto trx_id_str = trx_id.str();
+   const auto& trx_id = t->id;
+   const auto trx_id_str = trx_id.str();
+
+   fc::mutable_variant_object trans_doc;
+   fc::mutable_variant_object doc;
+
+   fc::from_variant( serializer->to_variant_with_abi( trx ), trans_doc );
+   trans_doc("trx_id", trx_id_str);
+
+   fc::variant signing_keys;
+   if( t->signing_keys.valid() ) {
+      signing_keys = t->signing_keys->second;
+   } else {
+      signing_keys = trx.get_signature_keys( *chain_id, false, false );
+   }
+
+   if( !signing_keys.is_null() ) {
+      trans_doc("signing_keys", signing_keys);
+   }
+
+   trans_doc("accepted", t->accepted);
+   trans_doc("implicit", t->implicit);
+   trans_doc("scheduled", t->scheduled);
+
+   doc("doc", trans_doc);
+   doc("doc_as_upsert", true);
+
+   fc::mutable_variant_object action_doc;
+   action_doc("_index", trans_index);
+   action_doc("_type", "_doc");
+   action_doc("_id", trx_id_str);
+   action_doc("retry_on_conflict", 100);
+
+   auto action = fc::json::to_string( fc::variant_object("update", action_doc) );
+   auto json = fc::prune_invalid_utf8( fc::json::to_string(doc) );
+
+   bulker& bulk = bulk_pool->get();
+   bulk.append_document(std::move(action), std::move(json));
+
+}
+
+void elasticsearch_plugin_impl::_process_irreversible_block( const chain::block_state_ptr& bs) {
+
+   const auto block_id = bs->block->id();
+   const auto block_id_str = block_id.str();
+   const auto block_num = bs->block->block_num();
+
+   if ( block_num % 10000 == 0 )
+      ilog("block_num: ${n}", ("n", block_num));
+
+
+   if (store_blocks) {
+
+      fc::mutable_variant_object block_doc;
+      fc::mutable_variant_object action_doc;
+
+      fc::from_variant( serializer->to_variant_with_abi( bs->block ), block_doc );
+      action_doc("_index", blocks_index);
+      action_doc("_type", "_doc");
+      action_doc("_id", block_id_str);
+
+      auto action = fc::json::to_string( fc::variant_object("index", action_doc) );
+      auto json = fc::prune_invalid_utf8( fc::json::to_string(block_doc) );
+
+      bulker& bulk = bulk_pool->get();
+      bulk.append_document(std::move(action), std::move(json));
+   }
+
+   if (store_block_states) {
+      fc::mutable_variant_object doc(*bs);
+      doc.erase("block");
+
+      fc::mutable_variant_object action_doc;
+      action_doc("_index", block_states_index);
+      action_doc("_type", "_doc");
+      action_doc("_id", block_id_str);
+
+      auto action = fc::json::to_string( fc::variant_object("index", action_doc) );
+      auto json = fc::json::to_string( doc );
+
+      bulker& bulk = bulk_pool->get();
+      bulk.append_document(std::move(action), std::move(json));
+   }
+
+   if (store_transactions) {
+      for( const auto& receipt : bs->block->transactions ) {
+         string trx_id_str;
+         if( receipt.trx.contains<packed_transaction>() ) {
+            const auto& pt = receipt.trx.get<packed_transaction>();
+            // get id via get_raw_transaction() as packed_transaction.id() mutates internal transaction state
+            const auto& raw = pt.get_raw_transaction();
+            const auto& trx = fc::raw::unpack<transaction>( raw );
+            if( !filter_include( trx ) ) continue;
+            const auto& id = trx.id();
+            trx_id_str = id.str();
+         } else {
+            const auto& id = receipt.trx.get<transaction_id_type>();
+            trx_id_str = id.str();
+         }
 
          fc::mutable_variant_object trans_doc;
          fc::mutable_variant_object doc;
 
-         fc::from_variant( serializer->to_variant_with_abi( trx ), trans_doc );
-         trans_doc("trx_id", trx_id_str);
-
-         fc::variant signing_keys;
-         if( t->signing_keys.valid() ) {
-            signing_keys = t->signing_keys->second;
-         } else {
-            signing_keys = trx.get_signature_keys( *chain_id, false, false );
-         }
-
-         if( !signing_keys.is_null() ) {
-            trans_doc("signing_keys", signing_keys);
-         }
-
-         trans_doc("accepted", t->accepted);
-         trans_doc("implicit", t->implicit);
-         trans_doc("scheduled", t->scheduled);
+         trans_doc("irreversible", true);
+         trans_doc("block_id", block_id_str);
+         trans_doc("block_num", static_cast<int32_t>(block_num));
 
          doc("doc", trans_doc);
          doc("doc_as_upsert", true);
@@ -572,15 +641,58 @@ void elasticsearch_plugin_impl::process_accepted_transaction( chain::transaction
          action_doc("retry_on_conflict", 100);
 
          auto action = fc::json::to_string( fc::variant_object("update", action_doc) );
-         auto json = fc::prune_invalid_utf8( fc::json::to_string(doc) );
-
+         auto json = fc::json::to_string( doc );
          bulker& bulk = bulk_pool->get();
          bulk.append_document(std::move(action), std::move(json));
+      }
+   }
+
+}
+
+void elasticsearch_plugin_impl::process_applied_transaction( const chain::transaction_trace_ptr& t) {
+   if( !t->producer_block_id.valid() )
+      return;
+
+   check_task_queue_size();
+   transaction_trace_queue.emplace_back(t);
+   thread_pool->enqueue(
+      [ this ]()
+      {
+         try {
+            _process_applied_transaction();
+         } catch (fc::exception& e) {
+            elog("FC Exception while processing applied transaction trace: ${e}", ("e", e.to_detail_string()));
+         } catch (std::exception& e) {
+            elog("STD Exception while processing applied transaction trace: ${e}", ("e", e.what()));
+         } catch (...) {
+            elog("Unknown exception while processing applied transaction trace");
+         }
       }
    );
 }
 
-void elasticsearch_plugin_impl::process_irreversible_block(chain::block_state_ptr bs) {
+void elasticsearch_plugin_impl::process_accepted_transaction( const chain::transaction_metadata_ptr& t) {
+   if( !start_block_reached || !store_transactions )
+      return;
+
+   check_task_queue_size();
+   thread_pool->enqueue(
+      [ t, this ]()
+      {
+         try {
+            _process_accepted_transaction( t );
+         } catch (fc::exception& e) {
+            elog("FC Exception while processing accepted transaction metadata: ${e}", ("e", e.to_detail_string()));
+         } catch (std::exception& e) {
+            elog("STD Exception while processing accepted tranasction metadata: ${e}", ("e", e.what()));
+         } catch (...) {
+            elog("Unknown exception while processing accepted transaction metadata");
+         }
+      }
+   );
+}
+
+void elasticsearch_plugin_impl::process_irreversible_block( const chain::block_state_ptr &bs) {
    if( !start_block_reached ) {
       if( bs->block_num >= start_block_num ) {
          start_block_reached = true;
@@ -593,84 +705,14 @@ void elasticsearch_plugin_impl::process_irreversible_block(chain::block_state_pt
    thread_pool->enqueue(
       [ bs, this ]()
       {
-         const auto block_id = bs->block->id();
-         const auto block_id_str = block_id.str();
-         const auto block_num = bs->block->block_num();
-
-         if ( block_num % 10000 == 0 )
-            ilog("block_num: ${n}", ("n", block_num));
-
-
-         if (store_blocks) {
-
-            fc::mutable_variant_object block_doc;
-            fc::mutable_variant_object action_doc;
-
-            fc::from_variant( serializer->to_variant_with_abi( bs->block ), block_doc );
-            action_doc("_index", blocks_index);
-            action_doc("_type", "_doc");
-            action_doc("_id", block_id_str);
-
-            auto action = fc::json::to_string( fc::variant_object("index", action_doc) );
-            auto json = fc::prune_invalid_utf8( fc::json::to_string(block_doc) );
-
-            bulker& bulk = bulk_pool->get();
-            bulk.append_document(std::move(action), std::move(json));
-         }
-
-         if (store_block_states) {
-            fc::mutable_variant_object doc(*bs);
-            doc.erase("block");
-
-            fc::mutable_variant_object action_doc;
-            action_doc("_index", block_states_index);
-            action_doc("_type", "_doc");
-            action_doc("_id", block_id_str);
-
-            auto action = fc::json::to_string( fc::variant_object("index", action_doc) );
-            auto json = fc::json::to_string( doc );
-
-            bulker& bulk = bulk_pool->get();
-            bulk.append_document(std::move(action), std::move(json));
-         }
-
-         if (store_transactions) {
-            for( const auto& receipt : bs->block->transactions ) {
-               string trx_id_str;
-               if( receipt.trx.contains<packed_transaction>() ) {
-                  const auto& pt = receipt.trx.get<packed_transaction>();
-                  // get id via get_raw_transaction() as packed_transaction.id() mutates internal transaction state
-                  const auto& raw = pt.get_raw_transaction();
-                  const auto& trx = fc::raw::unpack<transaction>( raw );
-                  if( !filter_include( trx ) ) continue;
-                  const auto& id = trx.id();
-                  trx_id_str = id.str();
-               } else {
-                  const auto& id = receipt.trx.get<transaction_id_type>();
-                  trx_id_str = id.str();
-               }
-
-               fc::mutable_variant_object trans_doc;
-               fc::mutable_variant_object doc;
-
-               trans_doc("irreversible", true);
-               trans_doc("block_id", block_id_str);
-               trans_doc("block_num", static_cast<int32_t>(block_num));
-
-               doc("doc", trans_doc);
-               doc("doc_as_upsert", true);
-
-               fc::mutable_variant_object action_doc;
-               action_doc("_index", trans_index);
-               action_doc("_type", "_doc");
-               action_doc("_id", trx_id_str);
-               action_doc("retry_on_conflict", 100);
-
-               auto action = fc::json::to_string( fc::variant_object("update", action_doc) );
-               auto json = fc::json::to_string( doc );
-               bulker& bulk = bulk_pool->get();
-               bulk.append_document(std::move(action), std::move(json));
-            }
+         try {
+            _process_irreversible_block( bs );
+         } catch (fc::exception& e) {
+            elog("FC Exception while processing irreversible block: ${e}", ("e", e.to_detail_string()));
+         } catch (std::exception& e) {
+            elog("STD Exception while processing irreversible block: ${e}", ("e", e.what()));
+         } catch (...) {
+            elog("Unknown exception while processing irreversible block");
          }
       }
    );
